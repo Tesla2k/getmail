@@ -23,8 +23,8 @@ Install:
   ```
 - Config file must be customized
   ```
-   cp /opt/getmail/settings.ini.example  /opt/getmail/settings.ini
-   vi /opt/getmail/settings.ini
+   cp /opt/getmail/conf/settings.ini.example  /opt/getmail/conf/settings.ini
+   vi /opt/getmail/conf/settings.ini
   ```
 - Start mailcow and getmail.
   ```
