@@ -66,6 +66,16 @@ class Getmail(threading.Thread):
         self.imap_password        = configparser_file.get(       config_name, 'imap_password')
         self.imap_move_folder     = configparser_file.get(       config_name, 'imap_move_folder', fallback="getmail")
         self.imap_sync_folder     = configparser_file.get(       config_name, 'imap_sync_folder', fallback="INBOX")
+        # Additional folders (comma-separated) drained over the SAME connection during
+        # the initial and periodic fetch, e.g. the Spam folder. This avoids a second
+        # IMAP connection/login per mailbox (IONOS limits simultaneous connections and
+        # drops the excess with SSL EOF errors). IDLE still runs only on
+        # imap_sync_folder (near-realtime); extra folders are picked up on the periodic
+        # safety fetch (imap_periodic_fetch_interval, default 60s).
+        self.imap_extra_fetch_folders = [f.strip() for f in configparser_file.get(
+            config_name, 'imap_extra_fetch_folders', fallback="").split(",") if f.strip()]
+        # Folder currently being fetched (for the X-getmail-retrieved-from-mailbox-folder header)
+        self._current_fetch_folder = self.imap_sync_folder
         self.imap_move_enable     = configparser_file.getboolean(config_name, 'imap_move_enable', fallback=False)
         self.imap_debug           = configparser_file.getboolean(config_name, 'imap_debug', fallback=False)
         # Safety net: force a full fetch every N seconds even if the server sent no
@@ -149,7 +159,7 @@ class Getmail(threading.Thread):
         self.imap_start_connection()
         self.create_imap_move_folder()
         logging.info("IMAP fetch mail - initial")
-        self.imap_fetch_mail()
+        self.fetch_all_folders()
         self.last_periodic_fetch = time.monotonic()
 
         # Start IDLE mode
@@ -183,7 +193,7 @@ class Getmail(threading.Thread):
             self.last_periodic_fetch = time.monotonic()
             logging.debug("periodic safety fetch")
             self.imap.idle_done()
-            self.imap_fetch_mail()
+            self.fetch_all_folders()
             self.imap.idle()
             return
 
@@ -224,9 +234,30 @@ class Getmail(threading.Thread):
             self.imap.idle()
             self.check_imap_idle_response_counter_between_renew = 0
 
+    def fetch_all_folders(self):
+        """Fetch the primary sync folder plus any imap_extra_fetch_folders over the
+        SAME IMAP connection. IDLE runs on the primary folder, so it is always
+        re-selected afterwards. Called on the initial and the periodic safety fetch."""
+        self._current_fetch_folder = self.imap_sync_folder
+        self.imap_fetch_mail()
+        for folder in self.imap_extra_fetch_folders:
+            try:
+                if not self.imap.folder_exists(folder):
+                    logging.debug("extra fetch folder %r does not exist, skipping" % folder)
+                    continue
+                self.imap.select_folder(folder)
+                self._current_fetch_folder = folder
+                self.imap_fetch_mail()
+            except Exception as e:
+                logging.error("ERROR: extra folder %r fetch failed: %s" % (folder, e))
+            finally:
+                # Return to the primary folder so IDLE resumes on it.
+                self._current_fetch_folder = self.imap_sync_folder
+                self.imap.select_folder(self.imap_sync_folder)
+
     def imap_fetch_mail(self):
         #https://github.com/mjs/imapclient/blob/011748fd687c43636a8ef2c3acb9fa85782b91bc/examples/email_parsing.py
-        messages = self.imap.search(criteria=u'ALL')       
+        messages = self.imap.search(criteria=u'ALL')
         #https://stackoverflow.com/questions/75444763/python-imaplib-fetching-icloud-mail-rfc822-not-working
         parts = 'RFC822'
         if self.imap_hostname == 'imap.mail.me.com':
@@ -335,7 +366,7 @@ class Getmail(threading.Thread):
             lmtp.set_debuglevel(1)
 
           email_message['X-getmail-retrieved-from-mailbox-user'] = self.imap_username
-          email_message['X-getmail-retrieved-from-mailbox-folder'] = self.imap_sync_folder
+          email_message['X-getmail-retrieved-from-mailbox-folder'] = self._current_fetch_folder
 
           envelope_from = sanitize_envelope_from(email_message, self.lmtp_recipient)
 
@@ -381,7 +412,7 @@ class Getmail(threading.Thread):
             smtp.set_debuglevel(1)
 
           email_message['X-getmail-retrieved-from-mailbox-user'] = self.imap_username
-          email_message['X-getmail-retrieved-from-mailbox-folder'] = self.imap_sync_folder
+          email_message['X-getmail-retrieved-from-mailbox-folder'] = self._current_fetch_folder
 
           smtp.ehlo()
           smtp.starttls()
